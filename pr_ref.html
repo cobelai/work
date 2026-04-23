@@ -18,7 +18,15 @@
         button:hover { background-color: #2980b9; }
         button:disabled { background-color: #95a5a6; cursor: not-allowed; }
         #status { margin-top: 15px; font-weight: bold; text-align: center; font-size: 15px;}
-        #preview { margin-top: 30px; border-collapse: collapse; width: 100%; display: none; font-size: 14px;}
+        #preview { 
+            margin-top: 30px; 
+            border-collapse: collapse; 
+            width: 100%; 
+            display: none; 
+            font-size: 14px;
+            table-layout: fixed;    /* 新增：固定表格佈局，防止撐爆容器 */
+            word-wrap: break-word;  /* 新增：強制長文字或 URL 自動換行 */
+        }
         #preview th, #preview td { border: 1px solid #ecf0f1; padding: 12px; text-align: left; vertical-align: top; width: 50%; white-space: pre-wrap; tab-size: 4; }
         #preview th { background-color: #f7f9fa; color: #2c3e50; }
     </style>
@@ -122,7 +130,39 @@
         const titleText = titleNode ? extractText(titleNode).trim() : "";
         const bodyText = bodyNode ? extractText(bodyNode) : "";
         
-        const paras = bodyText.split('\n').map(p => p.trimEnd()).filter(p => p.trim().length > 0);
+        // 按換行切割段落，並清空前後空白
+        let paras = bodyText.split('\n')
+            .map(p => p.trim())
+            .filter(p => p.length > 0);
+        
+        // --- 新增：過濾 TLB 及其他部門網頁的導航與 JS 殘留字眼 ---
+        paras = paras.filter(p => {
+            // 將字串轉為小寫並移除所有空白，方便精準比對 (即使換行或多咗空格都捉得返)
+            const strForMatch = p.toLowerCase().replace(/\s+/g, '');
+            
+            // 1. 攔截殘留的 JavaScript 函數
+            if (strForMatch.includes("createtopmenu();") || 
+                strForMatch.includes("createpress();") || 
+                strForMatch.includes("createsitemap();") || 
+                strForMatch.includes("createfooter();")) {
+                return false; // 發現垃圾代碼，過濾走
+            }
+            
+            // 2. 攔截常見的 Menu 導航字眼
+            const exactJunk = [
+                "主頁", "home",
+                "新聞公報及演講辭", "pressreleasesandspeeches",
+                "新聞公報", "pressreleases",
+                "press", "releasesandspeeches", "releases" // 針對斷行情況
+            ];
+            
+            if (exactJunk.includes(strForMatch)) {
+                return false; // 發現導航字眼，過濾走
+            }
+            
+            return true; // 正常段落，保留
+        });
+        // ----------------------------------------------------
         
         // 回傳時加入 tables 陣列
         return { title: titleText || doc.title, paras: paras, tables: tablesData };
@@ -180,13 +220,16 @@
             const zhStars = "＊＊＊＊＊＊＊＊＊＊＊＊＊＊＊＊＊＊＊";
             const enStars = "********************************************";
 
-            // 清理 URL 尾段的 fontSize 參數
+            // 4. 清理 URL 尾段的 fontSize 參數
             const cleanZhUrl = zhUrl.replace(/\?fontSize=\d+/g, "");
             const cleanEnUrl = enUrl.replace(/\?fontSize=\d+/g, "");
 
-            // 合併：中文左，英文右
-            const finalZh = [zhData.title, zhStars, cleanZhUrl, ...zhData.body];
-            const finalEn = [enData.title, enStars, cleanEnUrl, ...enData.body];
+            // --- 新增：徹底清走段落開頭的所有 Tab 和全形/半形空格 ---
+            const stripLeadingWhitespace = (str) => str.replace(/^[\s\u3000\xA0]+/g, '');
+
+            // 3. 合併時直接使用乾淨的 URL，並確保正文每段開頭只有一個標準 Tab
+            const finalZh = [zhData.title, zhStars, cleanZhUrl, ...zhData.body.map(p => "\t" + stripLeadingWhitespace(p))];
+            const finalEn = [enData.title, enStars, cleanEnUrl, ...enData.body.map(p => "\t" + stripLeadingWhitespace(p))];
 
             const maxLen = Math.max(finalZh.length, finalEn.length);
             previewBody.innerHTML = "";
@@ -216,7 +259,6 @@
         
         const formatTextRules = (text) => {
             let newText = text.replace(/（/g, '(').replace(/）/g, ')');
-            // 【修復 Hang 機問題】：確保這裡是 [, ] 而不是 [,\s]
             while (/(\d)[, ](\d{3})(?!\d)/.test(newText)) {
                 newText = newText.replace(/(\d)[, ](\d{3})(?!\d)/g, '$1\u00A0$2');
             }
@@ -224,8 +266,12 @@
             return newText;
         };
 
-        const createZhParagraph = (text, isBold = false) => {
-            text = formatTextRules(text);
+        // 1. 中文排版：加入判斷，如果是 URL 就不執行 formatTextRules
+        const createZhParagraph = (text, isBold = false, isUrl = false) => {
+            // 如果不是 URL，才執行數字 hard space 處理
+            if (!isUrl) {
+                text = formatTextRules(text);
+            }
             const runs = [];
             
             if (text.startsWith('\t')) {
@@ -240,27 +286,47 @@
                 else if (/^\d+$/.test(token)) { fontName = "Times New Roman"; }
 
                 runs.push(new docx.TextRun({
-                    text: token, size: 20, font: fontName, characterSpacing: 20, bold: isBold
+                    text: token, 
+                    size: 20, 
+                    font: fontName, 
+                    characterSpacing: isUrl ? undefined : 20, 
+                    bold: isBold
                 }));
             });
 
             return new docx.Paragraph({ 
-                children: runs, alignment: docx.AlignmentType.JUSTIFIED, keepLines: true, widowControl: true
+                children: runs, 
+                alignment: isUrl ? docx.AlignmentType.LEFT : docx.AlignmentType.JUSTIFIED, 
+                keepLines: true, 
+                widowControl: true
             });
         };
 
-        const createEnParagraph = (text, isBold = false) => {
-            text = formatTextRules(text);
+        // 2. 英文排版：加入 isUrl 參數，如果是 URL 就不執行 formatTextRules
+        const createEnParagraph = (text, isBold = false, isUrl = false) => {
+            // 如果不是 URL，才執行數字 hard space 處理
+            if (!isUrl) {
+                text = formatTextRules(text);
+            }
             const runs = [];
+            
             if (text.startsWith('\t')) {
                 runs.push(new docx.TextRun("\t"));
                 text = text.substring(1);
             }
+            
             runs.push(new docx.TextRun({
-                text: text, size: 18, font: "Times New Roman", bold: isBold
+                text: text, 
+                size: 18, 
+                font: "Times New Roman", 
+                bold: isBold
             }));
+            
             return new docx.Paragraph({ 
-                children: runs, alignment: docx.AlignmentType.JUSTIFIED, keepLines: true, widowControl: true
+                children: runs, 
+                alignment: isUrl ? docx.AlignmentType.LEFT : docx.AlignmentType.JUSTIFIED, 
+                keepLines: true, 
+                widowControl: true
             });
         };
 
@@ -281,7 +347,7 @@
 
             return new docx.Table({
                 width: { size: 100, type: docx.WidthType.PERCENTAGE }, // 維持佔滿半邊頁面
-                layout: docx.TableLayoutType.AUTOFIT, // <--- 新增呢行：要求 Word 根據內容長短自動分配每欄寬度
+                layout: docx.TableLayoutType.AUTOFIT, // 要求 Word 根據內容長短自動分配每欄寬度
                 rows: rows,
                 // 為內部表格加上幼黑框線
                 borders: {
@@ -301,23 +367,26 @@
             const enText = enParas[i] || "";
             const isTitle = (i === 0);
             
+            // 判斷該行是否為 URL
+            const isUrlRow = zhText.trim().startsWith("http"); 
+            
             // 檢查該段落是否為我們插入的表格標記
             const zhTableMatch = zhText.match(/\[\[\[TABLE_(\d+)\]\]\]/);
             const enTableMatch = enText.match(/\[\[\[TABLE_(\d+)\]\]\]/);
 
             let zhContent, enContent;
 
-            // 如果是表格標記，就生成表格；否則生成普通段落
             if (zhTableMatch && zhTables && zhTables[zhTableMatch[1]]) {
                 zhContent = createNestedTable(zhTables[zhTableMatch[1]], true);
             } else {
-                zhContent = createZhParagraph(zhText, isTitle);
+                zhContent = createZhParagraph(zhText, isTitle, isUrlRow);
             }
 
             if (enTableMatch && enTables && enTables[enTableMatch[1]]) {
                 enContent = createNestedTable(enTables[enTableMatch[1]], false);
             } else {
-                enContent = createEnParagraph(enText, isTitle);
+                // 💡 確保英文這裡也傳入 isUrlRow 狀態
+                enContent = createEnParagraph(enText, isTitle, isUrlRow);
             }
             
             tableRows.push(
