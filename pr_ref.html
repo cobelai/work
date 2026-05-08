@@ -139,7 +139,8 @@
         });
         // --------------------------------
 
-        const titleText = titleNode ? extractText(titleNode).trim() : "";
+        // 清理標題內的換行符號，防止後續生成檔名出錯
+        const titleText = titleNode ? extractText(titleNode).replace(/[\r\n]+/g, " ").trim() : "";
         const bodyText = bodyNode ? extractText(bodyNode) : "";
         
         let paras = bodyText.split('\n')
@@ -165,38 +166,71 @@
             return true; 
         });
         
-        return { title: titleText || doc.title, paras: paras, tables: tablesData };
+        let fallbackTitle = doc.title || "";
+        fallbackTitle = fallbackTitle.replace(/(\s*[-|]\s*)?(Press Releases|The Government of the Hong Kong Special Administrative Region|The Government of the HKSAR|香港特別行政區政府新聞公報|新聞公報|Transport and Logistics Bureau|運輸及物流局).*$/i, "").trim();
+
+        return { title: titleText || fallbackTitle, paras: paras, tables: tablesData };
     }
 
-    function parseStructure(data) {
-        const starIdx = data.paras.findIndex(p => {
+    // 專門處理 info.gov.hk (政府新聞公報) 的解析邏輯
+    function parseInfoGov(data) {
+        let title = data.title;
+        let body = data.paras;
+
+        const starIdx = body.findIndex(p => {
             const c = p.replace(/\s/g, '');
-            return c.length >= 5 && (/^[\*\uFF0A]+$/.test(c) || c.includes('***') || c.includes('＊＊＊'));
+            return c.length >= 3 && (/^[\*\uFF0A]+$/.test(c) || c.includes('***') || c.includes('＊＊＊'));
         });
 
+        // 嚴格切割：星號以下的才是正文，絕不把正文第一段誤認為標題
+        if (starIdx !== -1) {
+            body = body.slice(starIdx + 1);
+        }
+
+        let firstReal = 0;
+        for (let i = 0; i < Math.min(5, body.length); i++) {
+            const p = body[i];
+            const isDate = p.match(/\d{4}年\d{1,2}月\d{1,2}日/) || 
+                           p.match(/(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i) ||
+                           p.match(/^\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}/i);
+            const isMeta = p.length < 35 && (p.includes('Issued at') || p.includes('HKT') || p.includes('完') || p.includes('Ends') || p.includes('NNNN'));
+            if (isDate || isMeta) firstReal = i + 1;
+            else break;
+        }
+        
+        return { title, body: body.slice(firstReal), tables: data.tables };
+    }
+
+    // 專門處理 TLB 或其他部門網頁的解析邏輯
+    function parseOtherGov(data) {
         let title = data.title;
-        let bodyStartIdx = 0;
+        let body = data.paras;
+
+        const starIdx = body.findIndex(p => {
+            const c = p.replace(/\s/g, '');
+            return c.length >= 3 && (/^[\*\uFF0A]+$/.test(c) || c.includes('***') || c.includes('＊＊＊'));
+        });
 
         if (starIdx !== -1) {
             if (starIdx > 0) {
-                const prevLine = data.paras[starIdx - 1];
+                const prevLine = body[starIdx - 1];
                 if (prevLine.length > 5) title = prevLine;
             }
-            bodyStartIdx = starIdx + 1;
+            body = body.slice(starIdx + 1);
         } else {
-            // 防禦 3：針對沒有 *** 星號的網頁 (如 TLB) 進行智能標題辨識
-            const lcqIdx = data.paras.findIndex(p => p.match(/(LCQ\d+|立法會.+題)/i));
+            // 沒有星號時，尋找 LCQ 或強制取第一段
+            const lcqIdx = body.findIndex(p => p.match(/(LCQ\d+|立法會.+題)/i));
             if (lcqIdx !== -1) {
-                title = data.paras[lcqIdx];
-                bodyStartIdx = lcqIdx + 1;
-            } else if (data.paras.length > 0) {
-                // 如果連 LCQ 都沒有，強制將第一段當作標題
-                title = data.paras[0];
-                bodyStartIdx = 1;
+                title = body[lcqIdx];
+                body = body.slice(lcqIdx + 1);
+            } else if (body.length > 0) {
+                if (title.length < 15 || title.toLowerCase().includes("bureau") || title.includes("局")) {
+                    title = body[0];
+                    body = body.slice(1);
+                }
             }
         }
 
-        let body = data.paras.slice(bodyStartIdx);
         let firstReal = 0;
         for (let i = 0; i < Math.min(8, body.length); i++) {
             const p = body[i];
@@ -226,8 +260,12 @@
             statusLabel.innerText = "⏳ 正在分析網頁結構...";
             const [zhRaw, enRaw] = await Promise.all([fetchContent(zhUrl), fetchContent(enUrl)]);
 
-            const zhData = parseStructure(zhRaw);
-            const enData = parseStructure(enRaw);
+            // 🌟 分流處理：根據網址判斷是政府新聞公報還是 TLB 等部門
+            const zhIsInfo = zhUrl.includes('info.gov.hk');
+            const enIsInfo = enUrl.includes('info.gov.hk');
+
+            const zhData = zhIsInfo ? parseInfoGov(zhRaw) : parseOtherGov(zhRaw);
+            const enData = enIsInfo ? parseInfoGov(enRaw) : parseOtherGov(enRaw);
 
             const zhStars = "＊＊＊＊＊＊＊＊＊＊＊＊＊＊＊＊＊＊＊";
             const enStars = "********************************************";
@@ -249,7 +287,8 @@
             }
             document.getElementById('preview').style.display = "table";
 
-            const fileName = enData.title.replace(/[\\/:*?"<>|]/g, "_").trim() || "Press_Release";
+            // 清除標題內的換行符號，防止儲存檔案出錯
+            const fileName = enData.title.replace(/[\\/:*?"<>|]/g, "_").replace(/[\r\n]+/g, " ").trim() || "Press_Release";
             
             generateDocx(finalZh, finalEn, maxLen, fileName, zhData.tables, enData.tables);
             
