@@ -64,6 +64,7 @@
 <div class="container">
     <h1>📄 政府新聞稿一鍵 Word 排版工具</h1>
 
+    <!-- 區塊 1: info.gov.hk -->
     <div class="section">
         <div class="section-title"><i>📰</i> 政府新聞公報專區 (info.gov.hk)</div>
         <div class="input-group">
@@ -77,6 +78,7 @@
         <button class="btn btn-info" id="btnInfo" onclick="process('info')">📥 獲取並下載政府新聞公報 (DOCX)</button>
     </div>
 
+    <!-- 區塊 2: tlb.gov.hk -->
     <div class="section">
         <div class="section-title"><i>🏢</i> 運輸及物流局 / 個別局署專區 (tlb.gov.hk)</div>
         <div class="input-group">
@@ -110,21 +112,44 @@
     async function fetchContent(url) {
         let htmlStr = null;
         const targetUrl = url.split('?')[0] + `?t=${Date.now()}`;
+        const encodedUrl = encodeURIComponent(targetUrl);
+        
+        // 擴展代理伺服器列表，優先使用 raw 模式繞過解析錯誤
         const proxies = [
-            { url: `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`, type: 'json' },
-            { url: `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`, type: 'text' }
+            { url: `https://api.allorigins.win/raw?url=${encodedUrl}`, type: 'text' },
+            { url: `https://api.codetabs.com/v1/proxy?quest=${encodedUrl}`, type: 'text' },
+            { url: `https://corsproxy.io/?${encodedUrl}`, type: 'text' },
+            { url: `https://api.allorigins.win/get?url=${encodedUrl}`, type: 'json' }
         ];
 
         for (const proxy of proxies) {
             try {
-                const response = await fetch(proxy.url);
+                console.log(`正在嘗試代理: ${proxy.url}`);
+                
+                // 💡 新增：設置 8 秒超時控制器，防止卡死在無回應的代理伺服器上
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 8000);
+                
+                const response = await fetch(proxy.url, { 
+                    cache: 'no-store', 
+                    signal: controller.signal 
+                });
+                clearTimeout(timeoutId);
+
                 if (response.ok) {
                     htmlStr = (proxy.type === 'json') ? (await response.json()).contents : await response.text();
-                    if (htmlStr && htmlStr.length > 500) break;
+                    // 檢查抓取內容是否有效（500字為安全線）
+                    if (htmlStr && htmlStr.length > 500) {
+                        console.log(`✅ 代理成功: ${proxy.url}`);
+                        break;
+                    }
                 }
-            } catch (e) {}
+            } catch (e) {
+                console.warn(`⚠️ 代理請求失敗 (${proxy.url}):`, e.message);
+            }
         }
-        if (!htmlStr) throw new Error('無法抓取內容，請檢查網址。');
+        
+        if (!htmlStr) throw new Error('無法抓取內容。政府網頁防火牆可能暫時阻擋了代理連線，請稍後再試。');
         
         const doc = new DOMParser().parseFromString(htmlStr, "text/html");
 
@@ -136,15 +161,22 @@
                 else if (child.nodeType === 1) {
                     const tag = child.tagName.toLowerCase();
                     if (tag === "br") text += "\n";
-                    else if (["p", "div", "h1", "h2", "h3", "li", "tr"].includes(tag)) text += "\n" + extractText(child) + "\n";
+                    else if (["p", "div", "h1", "h2", "h3", "li", "tr", "article", "section"].includes(tag)) {
+                        text += "\n" + extractText(child) + "\n";
+                    }
                     else text += extractText(child);
                 }
             }
             return text;
         }
 
-        const titleNode = doc.getElementById("pr_title") || doc.querySelector("h1");
-        const bodyNode = doc.getElementById("pressrelease") || doc.querySelector(".pressrelease") || doc.getElementById("content") || doc.querySelector(".content") || doc.body;
+        const titleNode = doc.getElementById("pr_title") || doc.querySelector("h1") || doc.querySelector(".title");
+        const bodyNode = doc.getElementById("pressrelease") || 
+                         doc.querySelector(".pressrelease") || 
+                         doc.getElementById("content") || 
+                         doc.querySelector(".content") || 
+                         doc.querySelector("article") || 
+                         doc.body;
         
         // 表格抽取
         const tablesData = [];
@@ -152,13 +184,15 @@
         tables.forEach((table, index) => {
             let rowData = [];
             table.querySelectorAll("tr").forEach(tr => {
-                let cellData = Array.from(tr.children).filter(c => c.tagName === 'TD' || c.tagName === 'TH').map(c => c.innerText.trim());
+                let cellData = Array.from(tr.children)
+                    .filter(c => c.tagName === 'TD' || c.tagName === 'TH')
+                    .map(c => c.innerText.trim());
                 if (cellData.length > 0) rowData.push(cellData);
             });
             if (rowData.length > 0) {
                 tablesData.push(rowData);
                 const placeholder = doc.createTextNode(`\n[[[TABLE_${tablesData.length - 1}]]]\n`);
-                table.parentNode.replaceChild(placeholder, table);
+                if (table.parentNode) table.parentNode.replaceChild(placeholder, table);
             }
         });
 
@@ -218,7 +252,8 @@
 
         try {
             btn.disabled = true;
-            status.innerText = "⏳ 處理中...";
+            status.style.color = "#2c3e50";
+            status.innerText = "⏳ 處理中 (正在嘗試多個代理伺服器)...";
             const [zhRaw, enRaw] = await Promise.all([fetchContent(zhUrl), fetchContent(enUrl)]);
             
             const zhData = mode === 'info' ? parseInfoGov(zhRaw) : parseOtherGov(zhRaw);
@@ -244,9 +279,12 @@
             const fileName = enData.title.replace(/[\\/:*?"<>|]/g, "_").replace(/[\r\n]+/g, " ").trim() || "Press_Release";
             generateDocx(finalZh, finalEn, maxLen, fileName, zhData.tables, enData.tables);
             
+            status.style.color = "#27ae60";
             status.innerText = "✅ 完成！檔案已下載。";
         } catch (e) {
+            status.style.color = "#c0392b";
             status.innerText = "❌ 錯誤: " + e.message;
+            console.error(e);
         } finally { btn.disabled = false; }
     }
 
